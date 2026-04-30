@@ -166,19 +166,23 @@ def get_average_fridge_moisture_response():
     return "\n".join(lines)
 
 
+MOISTURE_QUERY = "what is the average moisture inside our kitchen fridges in the past hours, week and month?"
+WATER_QUERY = "what is the average water consumption per cycle across our smart dishwashers in the past hour, week and month?"
+ELECTRICITY_QUERY = "which house consumed more electricity in the past 24 hours, and by how much?"
+
 def process_query(query):
     query = query.strip().lower()
 
-    valid_queries = {
-        "1",
-        "moisture",
-        "fridge_moisture"
-    }
-
-    if query in valid_queries:
+    if query == MOISTURE_QUERY:
         return get_average_fridge_moisture_response()
 
-    return "Sorry, this query cannot be processed yet. Please try the fridge moisture query."
+    if query == WATER_QUERY:
+        return get_average_water_response()
+
+    if query == ELECTRICITY_QUERY:
+        return get_electricity_comparison_response()
+
+    return "Sorry, this query cannot be processed. Please try one of the supported queries."
 
 
 def get_port():
