@@ -592,8 +592,8 @@ def get_electricity_comparison_response():
         "",
         "Calculation used:",
         f"- Assumed household voltage: {HOUSE_VOLTAGE}V",
-        "- Simulated ammeter readings were treated as amps and converted to estimated kWh.",
-        "- Formula: kWh = (average amps * volts / 1000) * hours"
+        "- Formula per sensor: kWh = (average amps * volts / 1000) * hours",
+        "- House total = sum of estimated kWh from each electricity sensor in that house"
     ]
 
     add_completeness_lines(lines, start_time, now, fetch_info)
