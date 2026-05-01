@@ -11,14 +11,19 @@ load_dotenv()
 
 CHRIS_DATABASE_URL = os.getenv("CHRIS_DATABASE_URL")
 PARTNER_DATABASE_URL = os.getenv("PARTNER_DATABASE_URL")
+LOCAL_HOUSE = os.getenv("LOCAL_HOUSE", "House A")
+PARTNER_HOUSE = "House B" if LOCAL_HOUSE == "House A" else "House A"
 
-SENSOR_TABLE = "sensor_data_virtual"
+# Approx UTC time of when sharing occurred
+SHARING_START_UTC = os.getenv("SHARING_START_UTC", "2026-04-30T00:00:00+00:00")
 
 # Assumption for electricity calculation:
 # Ammeter readings are treated as amps
 # Power = volts * amps
 # Household voltage estimated to be 120v in US
+SENSOR_TABLE = "sensor_data_virtual"
 HOUSE_VOLTAGE = 120
+PST = timezone(timedelta(hours=-8), "PST")
 
 
 DEVICE_METADATA = {
@@ -60,25 +65,48 @@ DEVICE_METADATA = {
         "device_type": "microwave",
         "device_group": "Microwave",
         "owner": "Matthew"
-}}
+    }
+}
 
 
-def get_database_sources():
-    sources = []
+def parse_time(value):
+    value = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(value).astimezone(timezone.utc)
 
-    if CHRIS_DATABASE_URL:
-        sources.append({
-            "name": "Chris / House A NeonDB",
-            "url": CHRIS_DATABASE_URL
-        })
 
-    if PARTNER_DATABASE_URL:
-        sources.append({
-            "name": "Partner / House B NeonDB",
-            "url": PARTNER_DATABASE_URL
-        })
+SHARING_START_TIME = parse_time(SHARING_START_UTC)
 
-    return sources
+# Designate which is the local House depending on whose system the program is being run on
+if LOCAL_HOUSE == "House A":
+    LOCAL_DATABASE_URL = CHRIS_DATABASE_URL
+    PARTNER_DATABASE_URL_ACTIVE = PARTNER_DATABASE_URL
+    LOCAL_DATABASE_NAME = "Chris / House A NeonDB"
+    PARTNER_DATABASE_NAME = "Partner / House B NeonDB"
+else:
+    LOCAL_DATABASE_URL = PARTNER_DATABASE_URL
+    PARTNER_DATABASE_URL_ACTIVE = CHRIS_DATABASE_URL
+    LOCAL_DATABASE_NAME = "Matthew / House B NeonDB"
+    PARTNER_DATABASE_NAME = "Partner / House A NeonDB"
+
+
+DATABASES = {
+    "local": {
+        "name": LOCAL_DATABASE_NAME,
+        "url": LOCAL_DATABASE_URL
+    },
+    "partner": {
+        "name": PARTNER_DATABASE_NAME,
+        "url": PARTNER_DATABASE_URL_ACTIVE
+    }
+}
+
+def get_database(db_key):
+    db = DATABASES.get(db_key)
+
+    if db and db["url"]:
+        return db
+
+    return None
 
 
 def load_payload(payload):
@@ -89,13 +117,11 @@ def load_payload(payload):
 
 
 def get_boards_by_type(device_type):
-    boards = []
-
-    for board_name, info in DEVICE_METADATA.items():
-        if info["device_type"] == device_type:
-            boards.append(board_name)
-
-    return boards
+    return [
+        board_name
+        for board_name, info in DEVICE_METADATA.items()
+        if info["device_type"] == device_type
+    ]
 
 
 def get_all_boards():
@@ -137,35 +163,125 @@ def safe_float(value):
         return None
 
 
+def format_pst(dt):
+    return dt.astimezone(PST).strftime("%Y-%m-%d %I:%M %p PST")
+
+
+def query_database(db_key, start_time, end_time, board_names):
+    db = get_database(db_key)
+
+    if not db or not board_names:
+        return []
+
+    conn = psycopg2.connect(db["url"])
+    cur = conn.cursor()
+
+    cur.execute(f"""
+        SELECT time, payload
+        FROM {SENSOR_TABLE}
+        WHERE time >= %s
+          AND time < %s
+          AND payload->>'board_name' = ANY(%s)
+        ORDER BY time ASC;
+    """, (start_time, end_time, board_names))
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return [
+        {
+            "time": db_time,
+            "payload": payload,
+            "stored_in": db["name"],
+            "db_key": db_key
+        }
+        for db_time, payload in rows
+    ]
+
+
+def add_plan(plans, db_key, start_time, end_time, board_name):
+    if start_time >= end_time:
+        return
+
+    db = get_database(db_key)
+
+    if db is None:
+        return
+
+    key = (db_key, start_time, end_time)
+
+    if key not in plans:
+        plans[key] = []
+
+    plans[key].append(board_name)
+
+
+def build_fetch_plan(start_time, end_time, board_names):
+    plans = {}
+    local_incomplete = False
+    missing_partner_db = False
+
+    for board_name in board_names:
+        info = DEVICE_METADATA[board_name]
+
+        # Assumes the "local" database based on the .env variable
+
+        if info["house"] == LOCAL_HOUSE:
+            add_plan(plans, "local", start_time, end_time, board_name)
+            continue
+
+        if start_time < SHARING_START_TIME:
+            local_incomplete = True
+
+            pre_end = min(end_time, SHARING_START_TIME)
+            post_start = max(start_time, SHARING_START_TIME)
+
+            if get_database("partner"):
+                add_plan(plans, "partner", start_time, pre_end, board_name)
+            else:
+                missing_partner_db = True
+
+            # After sharing begins, House A's local DB should have the replicated House B rows.
+            # If the local DB is unavailable, fall back to the House B's original DB.
+            if get_database("local"):
+                add_plan(plans, "local", post_start, end_time, board_name)
+            else:
+                add_plan(plans, "partner", post_start, end_time, board_name)
+        else:
+            # Entire query window is after sharing began, so House A's local DB should
+            # already contain the replicated House B rows. Avoids double counting.
+            if get_database("local"):
+                add_plan(plans, "local", start_time, end_time, board_name)
+            else:
+                add_plan(plans, "partner", start_time, end_time, board_name)
+
+    return plans, local_incomplete, missing_partner_db
+
+
 def fetch_rows(start_time, end_time, board_names):
-    all_rows = []
+    plans, local_incomplete, missing_partner_db = build_fetch_plan(
+        start_time,
+        end_time,
+        board_names
+    )
 
-    for source in get_database_sources():
-        conn = psycopg2.connect(source["url"])
-        cur = conn.cursor()
+    rows = []
+    sources_used = set()
 
-        cur.execute(f"""
-            SELECT time, payload
-            FROM {SENSOR_TABLE}
-            WHERE time >= %s
-              AND time < %s
-              AND payload->>'board_name' = ANY(%s)
-            ORDER BY time ASC;
-        """, (start_time, end_time, board_names))
+    for (db_key, seg_start, seg_end), boards in plans.items():
+        rows.extend(query_database(db_key, seg_start, seg_end, boards))
 
-        rows = cur.fetchall()
+        db = get_database(db_key)
+        if db:
+            sources_used.add(db["name"])
 
-        cur.close()
-        conn.close()
-
-        for db_time, payload in rows:
-            all_rows.append({
-                "time": db_time,
-                "payload": payload,
-                "stored_in": source["name"]
-            })
-
-    return all_rows
+    return rows, {
+        "local_incomplete": local_incomplete,
+        "missing_partner_db": missing_partner_db,
+        "sources_used": sorted(sources_used)
+    }
 
 
 def parse_sensor_readings(rows, target_device_type, sensor_checker):
@@ -209,20 +325,18 @@ def parse_sensor_readings(rows, target_device_type, sensor_checker):
 
 
 def average(values):
-    if len(values) == 0:
+    if not values:
         return None
 
     return sum(values) / len(values)
 
 
-def values_since(readings, start_time):
-    values = []
-
-    for reading in readings:
-        if reading["time"] >= start_time:
-            values.append(reading["value"])
-
-    return values
+def values_since(readings, start_time, value_key="value"):
+    return [
+        reading[value_key]
+        for reading in readings
+        if reading["time"] >= start_time
+    ]
 
 
 def format_percent(value):
@@ -243,6 +357,31 @@ def format_kwh(value):
     return f"{value:.4f} kWh"
 
 
+def add_completeness_lines(lines, start_time, end_time, fetch_info):
+    lines.extend([
+        "",
+        "Completeness check:",
+        f"- Query window: {format_pst(start_time)} to {format_pst(end_time)}",
+        f"- DataNiz sharing start: {format_pst(SHARING_START_TIME)}"
+    ])
+
+    if fetch_info["local_incomplete"]:
+        lines.append("- This window includes pre-sharing time, so House B historical data was retrieved from the partner database.")
+    else:
+        lines.append("- This window is after sharing began, so the local database should contain the replicated peer data.")
+
+    if fetch_info["missing_partner_db"]:
+        lines.append("- Warning: PARTNER_DATABASE_URL is missing, so pre-sharing House B data may be incomplete.")
+
+    lines.append("- Sources used:")
+
+    if fetch_info["sources_used"]:
+        for source in fetch_info["sources_used"]:
+            lines.append(f"  - {source}")
+    else:
+        lines.append("  - No database sources were available")
+
+
 def get_average_fridge_moisture_response():
     now = datetime.now(timezone.utc)
 
@@ -254,8 +393,7 @@ def get_average_fridge_moisture_response():
 
     month_start = time_windows["Past month"]
     fridge_boards = get_boards_by_type("fridge")
-
-    rows = fetch_rows(month_start, now, fridge_boards)
+    rows, fetch_info = fetch_rows(month_start, now, fridge_boards)
     readings = parse_sensor_readings(rows, "fridge", is_moisture_sensor)
 
     lines = [
@@ -267,6 +405,8 @@ def get_average_fridge_moisture_response():
         values = values_since(readings, start_time)
         avg = average(values)
         lines.append(f"{label}: {format_percent(avg)} based on {len(values)} reading(s)")
+
+    add_completeness_lines(lines, month_start, now, fetch_info)
 
     lines.extend([
         "",
@@ -295,8 +435,7 @@ def get_average_water_response():
 
     month_start = time_windows["Past month"]
     dishwasher_boards = get_boards_by_type("dishwasher")
-
-    rows = fetch_rows(month_start, now, dishwasher_boards)
+    rows, fetch_info = fetch_rows(month_start, now, dishwasher_boards)
     readings = parse_sensor_readings(rows, "dishwasher", is_water_sensor)
 
     lines = [
@@ -308,6 +447,8 @@ def get_average_water_response():
         values = values_since(readings, start_time)
         avg = average(values)
         lines.append(f"{label}: {format_gallons(avg)} based on {len(values)} reading(s)")
+
+    add_completeness_lines(lines, month_start, now, fetch_info)
 
     lines.extend([
         "",
@@ -326,9 +467,7 @@ def get_average_water_response():
 
 
 def get_electricity_readings(start_time, end_time):
-    all_boards = get_all_boards()
-    rows = fetch_rows(start_time, end_time, all_boards)
-
+    rows, fetch_info = fetch_rows(start_time, end_time, get_all_boards())
     readings = []
 
     for row in rows:
@@ -363,7 +502,7 @@ def get_electricity_readings(start_time, end_time):
                 "stored_in": row["stored_in"]
             })
 
-    return readings
+    return readings, fetch_info
 
 
 def estimate_kwh_by_house(readings, start_time, end_time):
@@ -382,12 +521,10 @@ def estimate_kwh_by_house(readings, start_time, end_time):
 
     total_hours = (end_time - start_time).total_seconds() / 3600
 
-    for house, data in totals.items():
+    for data in totals.values():
         avg_amps = average(data["amp_readings"])
 
-        if avg_amps is None:
-            data["kwh"] = 0.0
-        else:
+        if avg_amps is not None:
             avg_watts = avg_amps * HOUSE_VOLTAGE
             data["kwh"] = (avg_watts / 1000) * total_hours
 
@@ -398,12 +535,11 @@ def get_electricity_comparison_response():
     now = datetime.now(timezone.utc)
     start_time = now - timedelta(hours=24)
 
-    readings = get_electricity_readings(start_time, now)
+    readings, fetch_info = get_electricity_readings(start_time, now)
     totals = estimate_kwh_by_house(readings, start_time, now)
 
     house_a_kwh = totals.get("House A", {}).get("kwh", 0.0)
     house_b_kwh = totals.get("House B", {}).get("kwh", 0.0)
-
     difference = abs(house_a_kwh - house_b_kwh)
 
     if house_a_kwh > house_b_kwh:
@@ -425,27 +561,24 @@ def get_electricity_comparison_response():
         "Calculation used:",
         f"- Assumed household voltage: {HOUSE_VOLTAGE}V",
         "- Simulated ammeter readings were treated as amps and converted to estimated kWh.",
-        "- Formula: kWh = (average amps * volts / 1000) * hours",
+        "- Formula: kWh = (average amps * volts / 1000) * hours"
+    ]
+
+    add_completeness_lines(lines, start_time, now, fetch_info)
+
+    lines.extend([
         "",
         "Metadata used:",
         "- House ownership came from DEVICE_METADATA",
         "- Electricity readings were grouped by house",
-        "- Board names were used to connect each record back to its device and house",
+        "- Board names connected each record back to its device and house",
         "",
         "Reading counts:"
-    ]
+    ])
 
     for house in ["House A", "House B"]:
         count = len(totals.get(house, {}).get("amp_readings", []))
         lines.append(f"- {house}: {count} electricity reading(s)")
-
-    if house_b_kwh == 0.0:
-        lines.extend([
-            "",
-            "Note:",
-            "House B currently shows 0.0000 kWh. If this is unexpected, add your partner's",
-            "real board names to DEVICE_METADATA and set PARTNER_DATABASE_URL in your .env file."
-        ])
 
     return "\n".join(lines)
 
