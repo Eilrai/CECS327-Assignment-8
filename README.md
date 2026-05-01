@@ -1,5 +1,5 @@
 # CECS 327 Assignment 8
-
+**Team Members:** Thien Nguyen and Matthew Saldivar  
 Distributed IoT smart-house system using a TCP client/server and NeonDB sensor data from DataNiz.
 
 ## Files
