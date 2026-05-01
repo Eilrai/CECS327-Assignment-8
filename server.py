@@ -507,26 +507,58 @@ def get_electricity_readings(start_time, end_time):
 
 def estimate_kwh_by_house(readings, start_time, end_time):
     totals = {}
+    sensors = {}
 
     for reading in readings:
         house = reading["house"]
+        sensor_key = (
+            house,
+            reading["board_name"],
+            reading["sensor_name"]
+        )
 
         if house not in totals:
             totals[house] = {
                 "amp_readings": [],
-                "kwh": 0.0
+                "kwh": 0.0,
+                "sensor_totals": []
             }
 
+        if sensor_key not in sensors:
+            sensors[sensor_key] = {
+                "house": house,
+                "board_name": reading["board_name"],
+                "device_group": reading["device_group"],
+                "sensor_name": reading["sensor_name"],
+                "amp_readings": []
+            }
+
+        sensors[sensor_key]["amp_readings"].append(reading["amps"])
         totals[house]["amp_readings"].append(reading["amps"])
 
     total_hours = (end_time - start_time).total_seconds() / 3600
 
-    for data in totals.values():
-        avg_amps = average(data["amp_readings"])
+    for sensor_data in sensors.values():
+        avg_amps = average(sensor_data["amp_readings"])
 
-        if avg_amps is not None:
-            avg_watts = avg_amps * HOUSE_VOLTAGE
-            data["kwh"] = (avg_watts / 1000) * total_hours
+        if avg_amps is None:
+            continue
+
+        avg_watts = avg_amps * HOUSE_VOLTAGE
+        sensor_kwh = (avg_watts / 1000) * total_hours
+        house = sensor_data["house"]
+
+        sensor_summary = {
+            "board_name": sensor_data["board_name"],
+            "device_group": sensor_data["device_group"],
+            "sensor_name": sensor_data["sensor_name"],
+            "avg_amps": avg_amps,
+            "kwh": sensor_kwh,
+            "reading_count": len(sensor_data["amp_readings"])
+        }
+
+        totals[house]["sensor_totals"].append(sensor_summary)
+        totals[house]["kwh"] += sensor_kwh
 
     return totals
 
