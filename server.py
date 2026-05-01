@@ -366,7 +366,7 @@ def add_completeness_lines(lines, start_time, end_time, fetch_info):
     ])
 
     if fetch_info["local_incomplete"]:
-        lines.append("- This window includes pre-sharing time, so House B historical data was retrieved from the partner database.")
+        lines.append(f"- This window includes pre-sharing time, so {PARTNER_HOUSE} historical data was retrieved from the partner database.")
     else:
         lines.append("- This window is after sharing began, so the local database should contain the replicated peer data.")
 
